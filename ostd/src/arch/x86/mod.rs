@@ -2,6 +2,7 @@
 
 //! Platform-specific code for the x86 platform.
 
+mod alternatives;
 pub(crate) mod boot;
 pub mod cpu;
 pub mod device;
@@ -97,6 +98,11 @@ pub(crate) unsafe fn late_init_on_bsp() {
 
     kernel::tsc::init_tsc_freq();
     timer::init_on_bsp();
+
+    // SAFETY: The kernel mapping is active and APs have not started. The only
+    // current alternatives are test functions, unreachable from interrupt and
+    // exception handlers (including NMI and MCE).
+    unsafe { alternatives::apply_on_bsp() };
 
     // SAFETY: We're on the BSP and we're ready to boot all APs.
     unsafe { crate::boot::smp::boot_all_aps() };

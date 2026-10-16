@@ -96,11 +96,27 @@ SECTIONS
     . = LOADADDR(.ap_boot) + SIZEOF(.ap_boot) + KERNEL_VMA;
 
     .text                   : AT(ADDR(.text) - KERNEL_VMA) {
+        __text_start = .;
         *(.text .text.*)
+        __text_end = .;
         PROVIDE(__etext = .);
     } : text
 
+    .altinstr_replacement   : AT(ADDR(.altinstr_replacement) - KERNEL_VMA) {
+        __altinstr_replacement_start = .;
+        KEEP(*(.altinstr_replacement))
+        __altinstr_replacement_end = .;
+    } : text
+
     . = ALIGN(4096);
+
+    .altinstructions        : AT(ADDR(.altinstructions) - KERNEL_VMA) {
+        __altinstructions_start = .;
+        KEEP(*(.altinstructions))
+        __altinstructions_end = .;
+    } : rodata
+    ASSERT((__altinstructions_end - __altinstructions_start) % 16 == 0,
+           "invalid alternatives descriptor table size")
 
     # The section to store exception table (ExTable).
     # This table is used for recovering from specific exception handling faults
