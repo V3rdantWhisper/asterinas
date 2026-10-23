@@ -115,8 +115,14 @@ SECTIONS
         KEEP(*(.altinstructions))
         __altinstructions_end = .;
     } : rodata
-    ASSERT((__altinstructions_end - __altinstructions_start) % 16 == 0,
+    ASSERT((__altinstructions_end - __altinstructions_start) % 20 == 0,
            "invalid alternatives descriptor table size")
+
+    # The registry is emitted from the same Rust declaration as the group IDs.
+    # OSDK uses it to validate all descriptors in this particular build.
+    .altgroups              : AT(ADDR(.altgroups) - KERNEL_VMA) {
+        KEEP(*(.altgroups))
+    } : rodata
 
     # The section to store exception table (ExTable).
     # This table is used for recovering from specific exception handling faults

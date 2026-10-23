@@ -99,10 +99,21 @@ pub(crate) unsafe fn late_init_on_bsp() {
     kernel::tsc::init_tsc_freq();
     timer::init_on_bsp();
 
+    // SAFETY: OSDK checked this final ELF before packaging. The permanent kernel
+    // mapping preserves its linked addresses, metadata, and replacement storage.
+    let alternative_table = unsafe { alternatives::AlternativeTable::from_linked_image() }
+        .expect("failed to decode alternatives table");
+    #[cfg_attr(not(ktest), expect(unused_mut))]
+    let mut alternative_builder = alternatives::AlternativePatchBuilder::<
+        alternatives::AlternativeBoot,
+    >::new(&alternative_table);
+    #[cfg(ktest)]
+    alternatives::configure_test_alternatives(&alternative_table, &mut alternative_builder);
+
     // SAFETY: The kernel mapping is active and APs have not started. The only
     // current alternatives are test functions, unreachable from interrupt and
     // exception handlers (including NMI and MCE).
-    unsafe { alternatives::apply_on_bsp() };
+    unsafe { alternative_builder.commit() };
 
     // SAFETY: We're on the BSP and we're ready to boot all APs.
     unsafe { crate::boot::smp::boot_all_aps() };

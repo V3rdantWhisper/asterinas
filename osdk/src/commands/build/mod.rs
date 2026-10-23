@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+mod alternatives;
 mod bin;
 mod grub;
 mod qcow2;
@@ -116,6 +117,18 @@ fn get_reusable_existing_bundle(
         let meta = get_cargo_metadata(None::<&str>, None::<&[&str]>).unwrap();
         PathBuf::from(meta.get("workspace_root").unwrap().as_str().unwrap())
     };
+    // An updated OSDK may change final-image validation or transformations.
+    // Never reuse an image packaged by an older executable.
+    let osdk_modified = std::env::current_exe()
+        .ok()?
+        .metadata()
+        .ok()?
+        .modified()
+        .ok()?;
+    if existing_bundle.last_modified_time() < osdk_modified {
+        info!("Building a new bundle: OSDK has been updated");
+        return None;
+    }
     if existing_bundle.last_modified_time() < get_last_modified_time(&workspace_root) {
         info!("Building a new bundle: workspace_root has been updated");
         return None;
@@ -123,7 +136,7 @@ fn get_reusable_existing_bundle(
     Some(existing_bundle)
 }
 
-/// If the source is not since modified and the last build is recent, we can reuse the existing bundle.
+/// Builds a kernel bundle, reusing an existing bundle when its inputs remain current.
 pub fn do_cached_build(
     bundle_path: impl AsRef<Path>,
     osdk_output_directory: impl AsRef<Path>,
@@ -149,6 +162,18 @@ pub fn do_cached_build(
         &rustflags,
     );
 
+    // Run on every invocation, even when Cargo reused an existing ELF or the
+    // bundle below is reusable. This is OSTD's static metadata safety boundary.
+    let validated_alternatives = (config.target_arch == Arch::X86_64).then(|| {
+        alternatives::ValidatedAlternatives::read(aster_elf.path()).unwrap_or_else(|err| {
+            error_msg!(
+                "Invalid x86 alternatives in {}: {err}",
+                aster_elf.path().display()
+            );
+            process::exit(Errno::BuildCrate as _);
+        })
+    });
+
     // Check the existing bundle's reusability
     if let Some(existing_bundle) = get_reusable_existing_bundle(&bundle_path, config, action)
         && aster_elf.modified_time() < &existing_bundle.last_modified_time()
@@ -165,6 +190,9 @@ pub fn do_cached_build(
     let mut bundle = Bundle::new(&bundle_path, config, action);
 
     let boot_elf = make_stripped_boot_elf(&osdk_output_directory, &aster_elf, build.strip_elf);
+    if let Some(validated) = &validated_alternatives {
+        verify_boot_alternatives(validated, &boot_elf);
+    }
 
     match boot.method {
         BootMethod::GrubRescueIso | BootMethod::GrubQcow2 => {
@@ -196,13 +224,24 @@ pub fn do_cached_build(
                     config.build.encoding.clone(),
                 )
             } else {
-                make_elf_for_qemu(boot_elf)
+                let elf = make_elf_for_qemu(boot_elf);
+                if let Some(validated) = &validated_alternatives {
+                    verify_boot_alternatives(validated, &elf);
+                }
+                elf
             };
             bundle.consume_aster_bin(aster_bin);
         }
     }
 
     bundle
+}
+
+fn verify_boot_alternatives(validated: &alternatives::ValidatedAlternatives, elf: &AsterBin) {
+    if let Err(err) = validated.verify_preserved(elf.path()) {
+        error_msg!("Invalid boot ELF {}: {err}", elf.path().display());
+        process::exit(Errno::BuildCrate as _);
+    }
 }
 
 fn build_kernel_elf(

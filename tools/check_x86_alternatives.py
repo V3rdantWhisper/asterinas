@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
 
-"""Check alternatives assembly and condition IDs with the pinned Rust toolchain."""
+"""Check alternatives assembly, group IDs, and typed patch requests with the pinned Rust toolchain."""
 
 import json
 from pathlib import Path
@@ -14,34 +14,70 @@ ROOT = Path(__file__).resolve().parents[1]
 MACROS = ROOT / "ostd/src/arch/x86/alternatives"
 
 
-def generate_id_registry_source(entries, body):
+def generate_harness(entries, body, *, builder=False):
+    # Use the actual registry implementation, replacing only its declaration so
+    # boundary/cfg cases do not require adding synthetic production groups.
+    registry = (MACROS / "registry.rs").read_text()
+    start = registry.index("define_alternative_groups! {")
+    end = registry.index("\n}", start) + 2
+    registry = registry[:start] + "define_alternative_groups! {\n" + entries + "\n}" + registry[end:]
+    modules = ""
+    support = ""
+    if builder:
+        modules = f"""
+const NOP_BYTE: u8 = 0x90;
+#[path = {json.dumps(str(MACROS / 'error.rs'))}]
+mod error;
+use error::AlternativesError;
+"""
+        # These harnesses only emit Rust metadata; they never execute commit.
+        # Compile the real writer with stand-ins for kernel IRQ and logging APIs.
+        support = """
+mod irq { pub(crate) fn disable_local() {} }
+#[macro_export]
+macro_rules! debug {
+    ($($args:tt)*) => { let _ = core::format_args!($($args)*); };
+}
+"""
+        for module in ("encoding", "table", "request", "patch"):
+            source = (MACROS / f"{module}.rs").read_text()
+            source = source.replace("#[cfg(ktest)]\nmod test;", "")
+            modules += f"mod {module} {{\n{source}\n}}\n"
     return f"""
-#[path = {json.dumps(str(MACROS / 'alternative_macros.rs'))}]
-mod alternative_macros;
-mod condition {{
-    use super::alternative_macros::define_alternative_ids;
-    define_alternative_ids! {{
-        pub(super) enum AlternativeId {{ {entries} }}
+extern crate alloc;
+{support}
+mod arch {{
+    mod alternatives {{
+        #[path = {json.dumps(str(MACROS / 'alternative_macros.rs'))}]
+        mod alternative_macros;
+        mod registry {{ {registry} }}
+        {modules}
+        use registry::{{AlternativeId, groups}};
+        {body}
     }}
+    pub fn run() {{ alternatives::run(); }}
 }}
-use condition::AlternativeId;
-{body}
+fn main() {{ arch::run(); }}
 """
 
 
+def generate_id_registry_source(entries, body):
+    return generate_harness(entries, body.replace("fn main()", "pub(super) fn run()"))
+
+
 def check_id_registry(directory):
-    # Cross a bitmap word boundary and put a conditional ID in the middle,
+    # Exercise a large registry and put a conditional ID in the middle,
     # so cfg changes must affect both enum numbering and the generated list.
-    entries = [f"Condition{index}," for index in range(65)]
-    entries.insert(10, "#[cfg(ktest)] TestCondition,")
+    entries = [f"Group{index}: Sequence," for index in range(65)]
+    entries.insert(10, "#[cfg(ktest)] TestGroup: Branch,")
     body = """
 fn main() {
-    assert_eq!(AlternativeId::COUNT, if cfg!(ktest) { 66 } else { 65 });
+    assert_eq!(AlternativeId::ALL.len(), if cfg!(ktest) { 66 } else { 65 });
     for (index, &id) in AlternativeId::ALL.iter().enumerate() {
         assert_eq!(id.as_raw() as usize, index);
         assert_eq!(AlternativeId::from_raw(index as u32), Some(id));
     }
-    assert_eq!(AlternativeId::from_raw(AlternativeId::COUNT as u32), None);
+    assert_eq!(AlternativeId::from_raw(AlternativeId::ALL.len() as u32), None);
     assert_eq!(AlternativeId::from_raw(u32::MAX), None);
 }
 """
@@ -50,19 +86,30 @@ fn main() {
     for configuration in ([], ["--cfg=ktest"]):
         executable = directory / "registry"
         result = subprocess.run(
-            ["rustc", "--edition=2024", *configuration, str(rust_source),
+            ["rustc", "--edition=2024", "-Clink-dead-code", *configuration, str(rust_source),
              "-o", str(executable)],
             cwd=ROOT, capture_output=True, text=True, check=False,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"condition registry: {result.stderr}")
+            raise RuntimeError(f"group registry: {result.stderr}")
         subprocess.run([str(executable)], check=True)
-        print(f"PASS: condition IDs, ktest={bool(configuration)}, word boundary and cfg")
+        registry_dump = directory / "altgroups.bin"
+        subprocess.run(
+            ["objcopy", "--dump-section", f".altgroups={registry_dump}", str(executable)],
+            capture_output=True, check=True,
+        )
+        count = 66 if configuration else 65
+        kinds = [0] * count
+        if configuration:
+            kinds[10] = 1
+        assert registry_dump.read_bytes() == struct.pack(f"<{3 + count}I", 1, 20, count, *kinds)
+        print(f"PASS: group IDs, ktest={bool(configuration)}, dense numbering and ELF registry")
 
     cases = [
-        ("duplicate-name", "First, First,", "fn main() {}", "E0428"),
-        ("explicit-number", "First = 7,", "fn main() {}", "no rules expected"),
-        ("untyped-id", "First,", """
+        ("duplicate-name", "First: Sequence, First: Sequence,", "fn main() {}", "E0428"),
+        ("explicit-number", "First = 7: Sequence,", "fn main() {}", "no rules expected"),
+        ("integer-tail-call-signature", "First: TailCall(u64),", "fn main() {}", "no rules expected"),
+        ("untyped-id", "First: Sequence,", """
 fn is_enabled(_: AlternativeId) -> bool { true }
 fn main() { is_enabled(0u32); }
 """, "E0308"),
@@ -75,8 +122,8 @@ fn main() { is_enabled(0u32); }
             cwd=ROOT, capture_output=True, text=True, check=False,
         )
         if result.returncode == 0 or diagnostic not in result.stderr:
-            raise RuntimeError(f"condition IDs, {name}: unexpected result\n{result.stderr}")
-        print(f"PASS: condition IDs, {name} rejected")
+            raise RuntimeError(f"group IDs, {name}: unexpected result\n{result.stderr}")
+        print(f"PASS: group IDs, {name} rejected")
 
 
 def generate_test_source(frontend, sites):
@@ -93,7 +140,7 @@ mod alternative_macros;
 pub unsafe extern "C" fn test_alternative() {{
     unsafe {{ core::arch::asm!(
         {templates}
-        alt_condition_id = const 1,
+        alt_group_id = const 1,
         out("rax") _,
         options(nostack),
     ); }}
@@ -113,6 +160,10 @@ test_alternative:
     ret
 .size test_alternative, .-test_alternative
 .purgem OSTD_ALTERNATIVE
+.purgem OSTD_ALTERNATIVE_BRANCH
+.purgem OSTD_ALTERNATIVE_TAIL_CALL
+.purgem OSTD_ALTERNATIVE_CALL
+.purgem OSTD_ALTERNATIVE_DESCRIPTOR
 """
     return f"""
 #![no_std]
@@ -153,17 +204,18 @@ def check_linked_slots(directory, sites):
     table_address, table = sections[".altinstructions"]
     text_address, text = sections[".text"]
     replacement_address, replacements = sections.get(".altinstr_replacement", (0, b""))
-    assert len(table) == len(sites) * 16
+    assert len(table) == len(sites) * 20
     assert replacements == b"".join(new for _, _, _, new in sites)
     previous_end = None
     for index, (_, _, old, new) in enumerate(sites):
-        target_offset, replacement_offset, condition, slot_len, replacement_len = (
-            struct.unpack_from("<iiIHH", table, index * 16)
+        target_offset, replacement_offset, group, slot_len, replacement_len, kind = (
+            struct.unpack_from("<iiIHHI", table, index * 20)
         )
-        assert condition == 1
+        assert group == 1
+        assert kind == 0
         assert slot_len == max(len(old), len(new))
         assert replacement_len == len(new)
-        target = table_address + index * 16 + target_offset
+        target = table_address + index * 20 + target_offset
         if previous_end is not None:
             assert target == previous_end
         previous_end = target + slot_len
@@ -171,7 +223,7 @@ def check_linked_slots(directory, sites):
         assert 0 <= text_offset <= len(text) - slot_len
         assert text[text_offset:text_offset + slot_len] == old + b"\x90" * (slot_len - len(old))
         if replacement_len:
-            source = table_address + index * 16 + 4 + replacement_offset - replacement_address
+            source = table_address + index * 20 + 4 + replacement_offset - replacement_address
             assert 0 <= source <= len(replacements) - replacement_len
             assert replacements[source:source + replacement_len] == new
 
@@ -180,60 +232,35 @@ def check_rust_interface(directory):
     nop = b"\x90"
     lfence = b"\x0f\xae\xe8"
     cases = [
-        ("typed-constant", """
-const CONDITION: AlternativeId = AlternativeId::Second;
-unsafe { alternative!("", "lfence", CONDITION); }
-""", [("", "lfence", b"", lfence)], None),
-        ("repeated-expansion", """
+        ("typed-group", 'unsafe { alternative!("", "lfence", groups::Second); }',
+         [("", "lfence", b"", lfence)], None),
+        ("repeated-expansion", '''
 unsafe {
-    alternative!("lfence", "", AlternativeId::Second,);
-    alternative!("nop", "lfence", AlternativeId::Second);
+    alternative!("lfence", "", groups::Second,);
+    alternative!("nop", "lfence", groups::Second);
 }
-""", [("lfence", "", lfence, b""), ("nop", "lfence", nop, lfence)], None),
-        ("flags-modified", """
-unsafe { alternative!("stc", "clc", AlternativeId::Second); }
-""", [("stc", "clc", b"\xf9", b"\xf8")], None),
-        ("untyped-id", """
-unsafe { alternative!("", "lfence", 1u32); }
-""", [], "E0308"),
-        ("foreign-id", """
-struct OtherId;
-impl OtherId { const fn as_raw(self) -> u32 { 1 } }
-unsafe { alternative!("", "lfence", OtherId); }
-""", [], "E0308"),
-        ("runtime-id", """
-let condition = AlternativeId::Second;
-unsafe { alternative!("", "lfence", condition); }
-""", [], "E0435"),
-        ("missing-unsafe", """
-alternative!("", "lfence", AlternativeId::Second);
-""", [], "E0133"),
+''', [("lfence", "", lfence, b""), ("nop", "lfence", nop, lfence)], None),
+        ("flags-modified", 'unsafe { alternative!("stc", "clc", groups::Second); }',
+         [("stc", "clc", b"\xf9", b"\xf8")], None),
+        ("untyped-group", 'unsafe { alternative!("", "lfence", u32); }', [], "E0277"),
+        ("branch-group", 'unsafe { alternative!("", "lfence", groups::Branch); }', [], "E0271"),
+        ("missing-unsafe", 'alternative!("", "lfence", groups::Second);', [], "E0133"),
     ]
     for optimization in (0, 3):
         for name, body, sites, diagnostic in cases:
             rust_source = directory / "check.rs"
-            # Match OSTD's module paths and import only the public-facing macro
-            # in a sibling consumer, so its helper names cannot resolve by accident.
-            rust_source.write_text(f"""
-#![no_std]
-mod arch {{
-    mod alternatives {{
-        #[path = {json.dumps(str(MACROS / 'alternative_macros.rs'))}]
-        mod alternative_macros;
-        mod condition {{
-            use super::alternative_macros::define_alternative_ids;
-            define_alternative_ids! {{
-                pub(super) enum AlternativeId {{ First, Second, }}
-            }}
-        }}
-        mod consumer {{
-            use super::{{alternative_macros::alternative, condition::AlternativeId}};
-            #[unsafe(no_mangle)]
-            pub extern "C" fn test_alternative() {{ {body} }}
-        }}
-    }}
+            source = generate_harness(
+                "First: Sequence, Second: Sequence, Branch: Branch,",
+                f'''
+mod consumer {{
+    use super::{{alternative_macros::alternative, registry::groups}};
+    #[unsafe(no_mangle)]
+    pub extern "C" fn test_alternative() {{ {body} }}
 }}
-""")
+pub(super) fn run() {{}}
+''',
+            )
+            rust_source.write_text("#![no_std]\n" + source)
             result = subprocess.run(
                 ["rustc", "--edition=2024", "--crate-type=lib", "--cfg=ktest",
                  "--target=x86_64-unknown-none", "--emit=obj,llvm-ir",
@@ -258,6 +285,82 @@ mod arch {{
                 assert len(assembly) == len(sites), label
                 assert all("~{memory}" in line and "~{flags}" in line for line in assembly), label
             print(f"PASS: {label}")
+
+
+def check_builder_types(directory):
+    entries = """
+Sequence: Sequence,
+Branch: Branch,
+TailCall: TailCall(extern "C" fn(u64) -> u64),
+OtherTailCall: TailCall(extern "C" fn(u64) -> u64),
+Call: Call,
+"""
+    cases = [
+        ("accepted-contracts", """
+let mut boot = AlternativePatchBuilder::<AlternativeBoot>::new(table);
+boot.replace_sequence(table.all::<groups::Sequence>()).unwrap();
+boot.set_branch(table.all::<groups::Branch>(), AlternativeBranchState::Disabled, AlternativeBranchState::Enabled).unwrap();
+boot.retarget_tail_call(table.all::<groups::TailCall>(), groups::TailCall::target(handler), groups::TailCall::target(handler)).unwrap();
+unsafe { boot.commit(); }
+let mut runtime = AlternativePatchBuilder::<AlternativeRuntime>::new(table);
+runtime.set_call(table.all::<groups::Call>(), AlternativeCallState::Disabled, AlternativeCallState::Disabled).unwrap();
+""", None),
+        ("runtime-sequence", """
+let mut builder = AlternativePatchBuilder::<AlternativeRuntime>::new(table);
+builder.replace_sequence(table.all::<groups::Sequence>());
+""", "E0599"),
+        ("wrong-site-kind", """
+let mut builder = AlternativePatchBuilder::<AlternativeBoot>::new(table);
+builder.set_branch(table.all::<groups::Sequence>(), AlternativeBranchState::Disabled, AlternativeBranchState::Enabled);
+""", "E0271"),
+        ("wrong-function-signature", "let _ = groups::TailCall::target(wrong_handler);", "E0308"),
+        ("wrong-tail-call-group", """
+let mut builder = AlternativePatchBuilder::<AlternativeBoot>::new(table);
+builder.retarget_tail_call(table.all::<groups::TailCall>(), groups::OtherTailCall::target(handler), groups::TailCall::target(handler));
+""", "E0308"),
+        ("ordinary-function-as-trampoline", "let _ = AlternativeCallState::Enabled(handler);", "E0308"),
+        ("consumed-builder", """
+let mut builder = AlternativePatchBuilder::<AlternativeBoot>::new(table);
+unsafe { builder.commit(); }
+builder.replace_sequence(table.all::<groups::Sequence>());
+""", "E0382"),
+        ("runtime-commit", """
+let builder = AlternativePatchBuilder::<AlternativeRuntime>::new(table);
+unsafe { builder.commit(); }
+""", "E0599"),
+        ("commit-without-unsafe", """
+let builder = AlternativePatchBuilder::<AlternativeBoot>::new(table);
+builder.commit();
+""", "E0133"),
+        ("private-preparation", """
+let builder = AlternativePatchBuilder::<AlternativeBoot>::new(table);
+let _ = builder.prepare();
+""", "E0624"),
+    ]
+    for name, body, diagnostic in cases:
+        source = generate_harness(entries, f"""
+use request::*;
+use table::AlternativeTable;
+extern "C" fn handler(value: u64) -> u64 {{ value }}
+extern "C" fn wrong_handler(value: u32) -> u32 {{ value }}
+fn exercise(table: &AlternativeTable) {{ {body} }}
+pub(super) fn run() {{}}
+""", builder=True)
+        rust_source = directory / "builder.rs"
+        rust_source.write_text(source)
+        result = subprocess.run(
+            ["rustc", "--edition=2024", "--crate-type=lib", "--emit=metadata",
+             str(rust_source), "-o", str(directory / "builder.rmeta")],
+            cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+        label = f"builder types, {name}"
+        if diagnostic is None:
+            passed = result.returncode == 0
+        else:
+            passed = result.returncode != 0 and diagnostic in result.stderr
+        if not passed:
+            raise RuntimeError(f"{label}: unexpected result\n{result.stderr}")
+        print(f"PASS: {label}")
 
 
 def main():
@@ -288,6 +391,7 @@ def main():
         directory = Path(temporary)
         check_id_registry(directory)
         check_rust_interface(directory)
+        check_builder_types(directory)
         for frontend in ("rust", "assembly"):
             for optimization in (0, 3):
                 for name, sites, diagnostic in cases:

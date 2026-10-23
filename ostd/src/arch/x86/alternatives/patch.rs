@@ -1,65 +1,87 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Instruction writes, readback verification, and local CPU serialization.
+//! Boot-time writes, expected-byte checks, and local instruction serialization.
+//!
+//! This is not an SMP text-poking backend. Runtime batches have no executor yet.
 
 use core::sync::atomic::{self, Ordering};
 
-use super::{AlternativesError, table::AlternativePatch};
+use super::{
+    AlternativesError,
+    request::{AlternativeBoot, AlternativePatch, AlternativePatchBatch, AlternativePatchData},
+};
 
-/// Writes enabled patches and serializes instruction execution before returning.
+/// Consumes a boot batch, checks every expected instruction, and commits its writes.
+///
+/// A failed expected-byte check makes no changes. A failure after writing starts
+/// is fatal to boot; no rollback is promised. Sequence originals are established
+/// by the boot caller's contract, not inferred from a snapshot of current text.
 ///
 /// # Safety
 ///
-/// Every patch must have passed descriptor validation against the live kernel
-/// image's disjoint text and replacement sections.
-/// The caller must uphold [`super::apply_on_bsp`]'s boot and execution
-/// requirements and exclusively own the writable target slots.
-/// No references into those slots may exist during this call.
-/// Source bytes must remain readable and immutable.
-/// An error is fatal to boot; there is no rollback.
-pub(super) unsafe fn commit_patches(
-    patches: &[AlternativePatch],
+/// The caller must uphold the execution, CPU, and mapping contracts of
+/// [`AlternativePatchBuilder::commit`](super::request::AlternativePatchBuilder::commit).
+/// Every target must be writable, exclusively owned, and unreachable throughout
+/// this operation, including from NMI and fault handlers. Linked replacement
+/// bytes must remain readable and immutable, with no references into targets.
+/// The batch's table must come from an image satisfying `from_linked_image`'s
+/// final ELF validation and loading contract.
+pub(super) unsafe fn apply_batch(
+    batch: AlternativePatchBatch<AlternativeBoot>,
 ) -> Result<usize, AlternativesError> {
-    // Calibration can enable IRQs earlier in boot. Protect the actual commit
-    // rather than assuming IF has remained clear since the BSP entry point.
+    // TODO: Allow NMI-reachable boot sites through a fixed NMI entry stub. The
+    // vector-2 stub must check a RIP-relative pause flag before entering common
+    // trap code or touching GS, and return through an unpatched path while
+    // normal NMI dispatch is paused. The stub, flag access, return path, and all
+    // their dependencies must exclude every patch site, including sequences.
+    // Publish the pause before writing and clear it only after instruction
+    // serialization, with compiler/CPU ordering enforced. NMI must never wait
+    // for this writer: it may have interrupted the writer on the same CPU.
+    // This scheme requires a valid entry stack and a boot policy that permits
+    // suppressing normal dispatch while retaining any required source handling;
+    // an early return alone does not preserve an event for later delivery.
+    // It applies only to ordinary BSP boot code before APs or userspace run.
+    // Runtime use also requires draining handlers already past the check and
+    // handling entry/stack transitions. Linux's stop_nmi()/ignore_nmis in
+    // arch/x86/kernel/{alternative,nmi}.c suppress normal dispatch, but do not
+    // prevent execution of the entry/exit code surrounding that check.
+    // No such exclusion is implemented yet; callers must keep NMI-reachable
+    // sites out of this batch. This plan does not provide MCE exclusion.
     let _irq_guard = crate::irq::disable_local();
-    let mut patched = 0;
-    for patch in patches.iter().filter(|patch| patch.is_enabled()) {
-        let target_range = patch.target_range();
-        let replacement_range = patch.replacement_range();
+    // SAFETY: All sites are mapped and exclusively owned under the caller's
+    // boot contract. No writer can invalidate a checked instruction before use.
+    unsafe { validate_expected_bytes(batch.patches())? };
 
-        // SAFETY: Validation checked lengths and bounds in disjoint sections.
-        // The caller guarantees writable, exclusively accessed
-        // slots that cannot execute during the commit.
+    for patch in batch.patches() {
+        let target = patch.target();
+        // SAFETY: Linked replacements remain readable; control encodings are
+        // owned by the batch. The final ELF check establishes disjoint ranges.
+        let replacement = unsafe { replacement_bytes(patch.data()) };
+        // SAFETY: The final ELF check establishes lengths and target ranges;
+        // the builder encodes control replacements to exactly fit their slots.
+        // The caller excludes all execution and references to these targets.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                replacement_range.start as *const u8,
-                target_range.start as *mut u8,
-                replacement_range.len(),
+                replacement.as_ptr(),
+                target.start as *mut u8,
+                replacement.len(),
             );
             core::ptr::write_bytes(
-                (target_range.start + replacement_range.len()) as *mut u8,
+                (target.start + replacement.len()) as *mut u8,
                 super::NOP_BYTE,
-                target_range.len() - replacement_range.len(),
+                target.len() - replacement.len(),
             );
         }
-        patched += 1;
     }
 
-    for patch in patches.iter().filter(|patch| patch.is_enabled()) {
-        let target_range = patch.target_range();
-        let replacement_range = patch.replacement_range();
-
-        for offset in 0..target_range.len() {
-            let expected = if offset < replacement_range.len() {
-                // SAFETY: The offset stays in the validated replacement range.
-                unsafe { ((replacement_range.start + offset) as *const u8).read_volatile() }
-            } else {
-                super::NOP_BYTE
-            };
-            // SAFETY: The offset is inside the validated original slot.
-            // A volatile read verifies memory rather than an optimized copy.
-            let actual = unsafe { ((target_range.start + offset) as *const u8).read_volatile() };
+    for patch in batch.patches() {
+        let target = patch.target();
+        // SAFETY: The same immutable sources remain valid during verification.
+        let replacement = unsafe { replacement_bytes(patch.data()) };
+        for offset in 0..target.len() {
+            let expected = replacement.get(offset).copied().unwrap_or(super::NOP_BYTE);
+            // SAFETY: The offset lies within the mapped, exclusively owned slot.
+            let actual = unsafe { ((target.start + offset) as *const u8).read_volatile() };
             if actual != expected {
                 return Err(AlternativesError::VerificationFailed);
             }
@@ -67,10 +89,51 @@ pub(super) unsafe fn commit_patches(
     }
 
     // Intel SDM Vol. 3A, "Self-Modifying Code": execute a serializing instruction
-    // between writing code and executing it. APs have not started yet. The
-    // compiler fences also prevent compiler motion across this boundary.
+    // between writing code and executing it. APs have not started yet.
     atomic::compiler_fence(Ordering::SeqCst);
     core::arch::x86_64::__cpuid(0);
     atomic::compiler_fence(Ordering::SeqCst);
-    Ok(patched)
+    Ok(batch.patches().len())
+}
+
+/// Checks all control-transfer expectations before the first write.
+///
+/// # Safety
+///
+/// Every patch's target must be mapped and readable. No writer may modify these
+/// locations concurrently. Sequence sources are not accessed by this check.
+pub(super) unsafe fn validate_expected_bytes(
+    patches: &[AlternativePatch],
+) -> Result<(), AlternativesError> {
+    for patch in patches {
+        let target = patch.target();
+        let AlternativePatchData::Control { expected, .. } = patch.data() else {
+            continue;
+        };
+        for (offset, &byte) in expected.iter().enumerate() {
+            // SAFETY: The caller guarantees readable, stable target storage.
+            let actual = unsafe { ((target.start + offset) as *const u8).read_volatile() };
+            if actual != byte {
+                return Err(AlternativesError::UnexpectedInstruction);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Borrows immutable replacement bytes for the duration of the write.
+///
+/// # Safety
+///
+/// A sequence range must refer to permanently resident, immutable replacement
+/// storage in the linked kernel image and must be valid for a shared slice.
+unsafe fn replacement_bytes(data: &AlternativePatchData) -> &[u8] {
+    match data {
+        AlternativePatchData::Sequence(range) => {
+            // SAFETY: The caller guarantees the linked replacement's lifetime,
+            // readability, and immutability, even for a zero-length sequence.
+            unsafe { core::slice::from_raw_parts(range.start as *const u8, range.len()) }
+        }
+        AlternativePatchData::Control { replacement, .. } => replacement,
+    }
 }
