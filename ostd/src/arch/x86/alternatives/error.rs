@@ -15,4 +15,7 @@ pub(in crate::arch) enum AlternativesError {
     UnexpectedInstruction,
     OverlappingSlots,
     VerificationFailed,
+    InvalidContext,
+    RuntimeUnavailable,
+    PatchingPoisoned,
 }

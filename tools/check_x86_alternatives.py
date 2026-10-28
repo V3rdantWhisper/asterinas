@@ -31,15 +31,49 @@ mod error;
 use error::AlternativesError;
 """
         # These harnesses only emit Rust metadata; they never execute commit.
-        # Compile the real writer with stand-ins for kernel IRQ and logging APIs.
+        # Compile both real writers with stand-ins for kernel infrastructure.
         support = """
-mod irq { pub(crate) fn disable_local() {} }
+static IN_BOOTSTRAP_CONTEXT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+mod irq {
+    pub(crate) fn disable_local() {}
+    pub(crate) struct InterruptLevel;
+    impl InterruptLevel {
+        pub(crate) fn current() -> Self { Self }
+        pub(crate) fn is_task_context(&self) -> bool { true }
+    }
+}
+mod cpu {
+    pub(crate) struct CpuSet;
+    impl CpuSet { pub(crate) fn new_full() -> Self { Self } }
+}
+mod task {
+    pub(crate) struct Task;
+    impl Task {
+        pub(crate) fn current() -> Option<Self> { Some(Self) }
+    }
+    pub(crate) mod atomic_mode { pub(crate) fn might_sleep() {} }
+}
+mod sync {
+    pub(crate) struct Mutex<T>(std::sync::Mutex<T>);
+    impl<T> Mutex<T> {
+        pub(crate) const fn new(value: T) -> Self { Self(std::sync::Mutex::new(value)) }
+        pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, T> { self.0.lock().unwrap() }
+    }
+}
+mod smp {
+    pub(crate) struct Sender;
+    impl Sender { pub(crate) fn get(&self) -> Option<&Self> { Some(self) } }
+    pub(crate) static IPI_SENDER: Sender = Sender;
+    pub(crate) struct PendingIpis;
+    impl PendingIpis { pub(crate) fn wait(&self) {} }
+    pub(crate) fn inter_processor_call(_: &crate::cpu::CpuSet, _: fn()) -> PendingIpis { PendingIpis }
+}
 #[macro_export]
 macro_rules! debug {
     ($($args:tt)*) => { let _ = core::format_args!($($args)*); };
 }
 """
-        for module in ("encoding", "table", "request", "patch"):
+        for module in ("encoding", "table", "request", "patch", "runtime"):
             source = (MACROS / f"{module}.rs").read_text()
             source = source.replace("#[cfg(ktest)]\nmod test;", "")
             modules += f"mod {module} {{\n{source}\n}}\n"
@@ -47,6 +81,10 @@ macro_rules! debug {
 extern crate alloc;
 {support}
 mod arch {{
+    pub(crate) mod irq {{ pub(crate) fn is_local_enabled() -> bool {{ true }} }}
+    pub(crate) mod trap {{
+        pub(crate) struct TrapFrame {{ pub(crate) rip: usize, pub(crate) rsp: usize }}
+    }}
     mod alternatives {{
         #[path = {json.dumps(str(MACROS / 'alternative_macros.rs'))}]
         mod alternative_macros;
@@ -304,6 +342,7 @@ boot.retarget_tail_call(table.all::<groups::TailCall>(), groups::TailCall::targe
 unsafe { boot.commit(); }
 let mut runtime = AlternativePatchBuilder::<AlternativeRuntime>::new(table);
 runtime.set_call(table.all::<groups::Call>(), AlternativeCallState::Disabled, AlternativeCallState::Disabled).unwrap();
+unsafe { runtime.commit().unwrap(); }
 """, None),
         ("runtime-sequence", """
 let mut builder = AlternativePatchBuilder::<AlternativeRuntime>::new(table);
@@ -324,10 +363,15 @@ let mut builder = AlternativePatchBuilder::<AlternativeBoot>::new(table);
 unsafe { builder.commit(); }
 builder.replace_sequence(table.all::<groups::Sequence>());
 """, "E0382"),
-        ("runtime-commit", """
+        ("runtime-commit-without-unsafe", """
 let builder = AlternativePatchBuilder::<AlternativeRuntime>::new(table);
-unsafe { builder.commit(); }
-""", "E0599"),
+builder.commit();
+""", "E0133"),
+        ("consumed-runtime-builder", """
+let builder = AlternativePatchBuilder::<AlternativeRuntime>::new(table);
+unsafe { builder.commit().unwrap(); }
+unsafe { builder.commit().unwrap(); }
+""", "E0382"),
         ("commit-without-unsafe", """
 let builder = AlternativePatchBuilder::<AlternativeBoot>::new(table);
 builder.commit();

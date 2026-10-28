@@ -2,7 +2,7 @@
 
 //! Boot-time writes, expected-byte checks, and local instruction serialization.
 //!
-//! This is not an SMP text-poking backend. Runtime batches have no executor yet.
+//! Runtime writes use the separate SMP protocol in `runtime`.
 
 use core::sync::atomic::{self, Ordering};
 
@@ -20,7 +20,7 @@ use super::{
 /// # Safety
 ///
 /// The caller must uphold the execution, CPU, and mapping contracts of
-/// [`AlternativePatchBuilder::commit`](super::request::AlternativePatchBuilder::commit).
+/// boot builder's `commit` method.
 /// Every target must be writable, exclusively owned, and unreachable throughout
 /// this operation, including from NMI and fault handlers. Linked replacement
 /// bytes must remain readable and immutable, with no references into targets.

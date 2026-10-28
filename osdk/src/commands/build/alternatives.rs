@@ -54,8 +54,8 @@ impl ValidatedAlternatives {
     pub(super) fn read(path: &Path) -> Result<Self, String> {
         let bytes = fs::read(path).map_err(|err| err.to_string())?;
         let image = AlternativeElf::parse(&bytes)?;
-        let count = image.validate()?;
-        image.validate_symbols()?;
+        let protected = image.validate_symbols()?;
+        let count = image.validate(&protected)?;
         info!("Validated {count} x86 alternatives in {}", path.display());
         Ok(Self {
             sections: image
@@ -162,7 +162,7 @@ impl<'a> AlternativeElf<'a> {
         ]
     }
 
-    fn validate(&self) -> Result<usize, String> {
+    fn validate(&self, protected: &Range<u64>) -> Result<usize, String> {
         let Self {
             text,
             replacements,
@@ -214,6 +214,15 @@ impl<'a> AlternativeElf<'a> {
             let address = table.range.start + (index * DESCRIPTOR_SIZE) as u64;
             let target = validate_descriptor(record, address, &kinds, text, replacements)
                 .map_err(|err| format!("alternative #{index} at {address:#x}: {err}"))?;
+            if AlternativeKind::from_raw(u32_at(record, 16))? != AlternativeKind::Sequence
+                && !protected.is_empty()
+                && target.start < protected.end
+                && protected.start < target.end
+            {
+                return Err(format!(
+                    "alternative #{index} at {address:#x}: runtime slot overlaps protected text"
+                ));
+            }
             targets.push(target);
         }
         targets.sort_unstable_by_key(|range| range.start);
@@ -223,7 +232,7 @@ impl<'a> AlternativeElf<'a> {
         Ok(targets.len())
     }
 
-    fn validate_symbols(&self) -> Result<(), String> {
+    fn validate_symbols(&self) -> Result<Range<u64>, String> {
         let symbols = find_section(&self.elf, ".symtab")?;
         if symbols.get_type()? != ShType::SymTab
             || symbols.entry_size() != 24
@@ -238,6 +247,18 @@ impl<'a> AlternativeElf<'a> {
         let strings = self.elf.section_header(strings_index)?;
         let strings = file_bytes(self.elf.input, strings.offset(), strings.size())?;
         let symbols = file_bytes(self.elf.input, symbols.offset(), symbols.size())?;
+        let symbol_value_fn = |name: &str| -> Result<u64, String> {
+            let mut found = None;
+            for symbol in symbols.as_chunks::<24>().0.iter() {
+                if string_at(strings, u32_at(symbol, 0))? == name
+                    && u16_at(symbol, 6) != 0
+                    && found.replace(u64_at(symbol, 8)).is_some()
+                {
+                    return Err(format!("duplicate linker symbol {name}"));
+                }
+            }
+            found.ok_or_else(|| format!("missing linker symbol {name}"))
+        };
         for (section, prefix) in [
             (&self.text, "__text"),
             (&self.replacements, "__altinstr_replacement"),
@@ -245,18 +266,22 @@ impl<'a> AlternativeElf<'a> {
         ] {
             for (suffix, expected) in [("start", section.range.start), ("end", section.range.end)] {
                 let name = format!("{prefix}_{suffix}");
-                let mut values = Vec::new();
-                for symbol in symbols.as_chunks::<24>().0.iter() {
-                    if string_at(strings, u32_at(symbol, 0))? == name && u16_at(symbol, 6) != 0 {
-                        values.push(u64_at(symbol, 8));
-                    }
-                }
-                if values != [expected] {
+                if symbol_value_fn(&name)? != expected {
                     return Err(format!("{name} does not match the section boundary"));
                 }
             }
         }
-        Ok(())
+        let protected = symbol_value_fn("__alternatives_protected_start")?
+            ..symbol_value_fn("__alternatives_protected_end")?;
+        if protected.start > protected.end {
+            return Err("reversed protected text boundaries".into());
+        }
+        require_contains(
+            &self.text.range,
+            &protected,
+            "protected range outside .text",
+        )?;
+        Ok(protected)
     }
 }
 

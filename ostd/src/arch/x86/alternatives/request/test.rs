@@ -91,8 +91,8 @@ fn stale_expectations_fail_before_writing() {
         )
         .unwrap();
     let batch = builder.prepare().unwrap();
-    // SAFETY: Boot patching is over; these linked sites remain mapped and no
-    // runtime writer exists. This check itself performs no writes.
+    // SAFETY: These mapped boot-test sites are never selected by a successful
+    // runtime commit. This check itself performs no writes.
     assert_eq!(
         unsafe { patch::validate_expected_bytes(&batch.patches) },
         Err(AlternativesError::UnexpectedInstruction)
@@ -111,6 +111,8 @@ fn relative_control_transfers_check_both_displacement_limits() {
             i32::from_le_bytes(bytes[1..].try_into().unwrap()),
             displacement
         );
+        let (_, decoded_destination) = encoding::decode_control_transfer(address, &bytes).unwrap();
+        assert_eq!(decoded_destination, destination);
     }
     assert_eq!(
         encoding::encode_control_transfer(Jump, address, next + i32::MAX as usize + 1),

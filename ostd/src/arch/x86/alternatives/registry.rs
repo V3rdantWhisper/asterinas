@@ -18,6 +18,9 @@ define_alternative_groups! {
     #[cfg(ktest)] TestBranch: Branch,
     #[cfg(ktest)] TestTailCall: TailCall(unsafe extern "C" fn(u64) -> u64),
     #[cfg(ktest)] TestTrace: Call,
+    #[cfg(ktest)] TestRuntimeBranch: Branch,
+    #[cfg(ktest)] TestRuntimeTailCall: TailCall(unsafe extern "C" fn(u64) -> u64),
+    #[cfg(ktest)] TestRuntimeTrace: Call,
 }
 
 /// A group declared in the alternatives registry.

@@ -33,6 +33,18 @@ _trap_handler_\i:
     jmp     trap_common
 .else
     push    0           # fill in error code in TrapFrame
+.if \i == 3
+    # A kernel INT3 may emulate CALL by pushing a return address onto the
+    # interrupted stack. Duplicate the six-word hardware/error frame to leave
+    # a 48-byte gap above it, without clobbering registers or changing alignment.
+    # User entry keeps the original layout expected by _trap_from_user.
+    test byte ptr [rsp + 2*8], 3
+    jnz .Lbp_no_gap_\@
+    .rept 6
+        push qword ptr [rsp + 5*8]
+    .endr
+.Lbp_no_gap_\@:
+.endif
     push    \i          # interrupt vector
     jmp     trap_common
 .endif

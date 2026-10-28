@@ -7,16 +7,21 @@ use super::*;
 // Exercise real ELF parsing, symbol boundaries, LOAD mappings and resolved
 // offsets, rather than handing the checker pre-parsed synthetic records.
 const ASSEMBLY: &str = r#"
-.section .text,"ax"
+.text
+.code64
+
 sequence: .byte 0x90, 0x90, 0x90
 branch: .byte 0x0f, 0x1f, 0x44, 0, 0
 tail_call: .byte 0xe9
       .long destination - . - 4
 call: .byte 0x0f, 0x1f, 0x44, 0, 0
 destination: ret
-.section .altinstr_replacement,"ax"
+.section .altinstr_replacement,"ax",@progbits
+.code64
+
 replacement: lfence
-.section .altinstructions,"a"
+.section .altinstructions,"a",@progbits
+
 .balign 4
 .long sequence - ., replacement - ., 0
 .short 3, 3
@@ -30,7 +35,8 @@ replacement: lfence
 .long call - ., 0, 3
 .short 5, 0
 .long 3
-.section .altgroups,"a"
+.section .altgroups,"a",@progbits
+
 .balign 4
 .long 1, 20, 4, 0, 1, 2, 3
 "#;
@@ -40,7 +46,11 @@ PHDRS { code PT_LOAD FLAGS(5); rodata PT_LOAD FLAGS(4); }
 SECTIONS {
     . = 0xffffffff88000000;
     .text : AT(ADDR(.text) - 0xffffffff80000000) {
-        __text_start = .; *(.text) __text_end = .;
+        __text_start = .;
+        __alternatives_protected_start = .;
+        *(.text.alternatives_protected)
+        __alternatives_protected_end = .;
+        *(.text) __text_end = .;
     } : code
     .altinstr_replacement : AT(ADDR(.altinstr_replacement) - 0xffffffff80000000) {
         __altinstr_replacement_start = .;
@@ -58,9 +68,13 @@ SECTIONS {
 "#;
 
 fn linked_fixture() -> Vec<u8> {
+    linked_fixture_with(ASSEMBLY, LINKER_SCRIPT)
+}
+
+fn linked_fixture_with(assembly: &str, linker_script: &str) -> Vec<u8> {
     let directory = tempfile::tempdir().unwrap();
-    fs::write(directory.path().join("sites.S"), ASSEMBLY).unwrap();
-    fs::write(directory.path().join("sites.ld"), LINKER_SCRIPT).unwrap();
+    fs::write(directory.path().join("sites.S"), assembly).unwrap();
+    fs::write(directory.path().join("sites.ld"), linker_script).unwrap();
     for (command, args) in [
         ("as", vec!["--64", "sites.S", "-o", "sites.o"]),
         ("ld", vec!["-T", "sites.ld", "sites.o", "-o", "sites.elf"]),
@@ -85,11 +99,42 @@ fn section_offset(bytes: &[u8], name: &str) -> usize {
         .offset() as usize
 }
 
+fn section_header_offset(elf: &ElfFile<'_>, name: &str) -> usize {
+    let index = (1..elf.header.pt2.sh_count())
+        .find(|index| elf.section_header(*index).unwrap().get_name(elf).unwrap() == name)
+        .unwrap();
+    elf.header.pt2.sh_offset() as usize
+        + usize::from(index) * usize::from(elf.header.pt2.sh_entry_size())
+}
+
+fn set_symbol_value(bytes: &mut [u8], name: &str, value: u64) {
+    let elf = ElfFile::new(bytes).unwrap();
+    let symbols = find_section(&elf, ".symtab").unwrap();
+    let strings = find_section(&elf, ".strtab").unwrap();
+    let strings = strings.raw_data(&elf);
+    let index = symbols
+        .raw_data(&elf)
+        .as_chunks::<24>()
+        .0
+        .iter()
+        .position(|symbol| string_at(strings, u32_at(symbol, 0)).unwrap() == name)
+        .unwrap();
+    let offset = symbols.offset() as usize + index * 24 + 8;
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn clear_descriptors(bytes: &mut [u8]) {
+    let elf = ElfFile::new(bytes).unwrap();
+    let start = find_section(&elf, ".altinstructions").unwrap().address();
+    let size_field = section_header_offset(&elf, ".altinstructions") + 32;
+    bytes[size_field..size_field + 8].copy_from_slice(&0u64.to_le_bytes());
+    set_symbol_value(bytes, "__altinstructions_end", start);
+}
+
 fn validate(bytes: &[u8]) -> Result<usize, String> {
     let image = AlternativeElf::parse(bytes)?;
-    let count = image.validate()?;
-    image.validate_symbols()?;
-    Ok(count)
+    let protected = image.validate_symbols()?;
+    image.validate(&protected)
 }
 
 fn assert_invalid(bytes: &[u8], message: &str) {
@@ -185,12 +230,7 @@ fn initial_control_instructions_are_checked() {
 fn table_layout_and_load_mapping_are_checked() {
     let original = linked_fixture();
     let elf = ElfFile::new(&original).unwrap();
-    let header_index = (1..elf.header.pt2.sh_count())
-        .find(|index| {
-            elf.section_header(*index).unwrap().get_name(&elf).unwrap() == ".altinstructions"
-        })
-        .unwrap();
-    let header_offset = elf.header.pt2.sh_offset() as usize + usize::from(header_index) * 64;
+    let header_offset = section_header_offset(&elf, ".altinstructions");
     for (field, value, message) in [
         (32, 79u64, "multiple of 20"),
         (16, u64_at(&original, header_offset + 16) + 1, "aligned"),
@@ -200,6 +240,10 @@ fn table_layout_and_load_mapping_are_checked() {
         let mut bytes = original.clone();
         bytes[header_offset + field..header_offset + field + 8]
             .copy_from_slice(&value.to_le_bytes());
+        if field == 32 {
+            let end = find_section(&elf, ".altinstructions").unwrap().address() + value;
+            set_symbol_value(&mut bytes, "__altinstructions_end", end);
+        }
         assert_invalid(&bytes, message);
     }
     let mut unmapped = original.clone();
@@ -293,12 +337,7 @@ fn decoy_descriptors_cannot_hide_the_bytes_loaded_at_runtime() {
     let mut bytes = linked_fixture();
     let elf = ElfFile::new(&bytes).unwrap();
     let table = find_section(&elf, ".altinstructions").unwrap();
-    let table_index = (1..elf.header.pt2.sh_count())
-        .find(|index| {
-            elf.section_header(*index).unwrap().get_name(&elf).unwrap() == ".altinstructions"
-        })
-        .unwrap();
-    let section_header = elf.header.pt2.sh_offset() as usize + usize::from(table_index) * 64;
+    let section_header = section_header_offset(&elf, ".altinstructions");
     let program_headers = elf.header.pt2.ph_offset() as usize;
     let table_offset = table.offset() as usize;
     let table_address = table.address();
@@ -335,4 +374,70 @@ fn decoy_descriptors_cannot_hide_the_bytes_loaded_at_runtime() {
         decoy[field..field + 8].copy_from_slice(&value.to_le_bytes());
     }
     assert_invalid(&bytes, "overlapping virtual LOAD segments");
+}
+
+#[test]
+fn protected_text_accepts_boot_sequences_but_rejects_every_runtime_kind() {
+    let protected = ".section .text.alternatives_protected,\"ax\",@progbits\n.code64\n\n";
+    let boot_only = ASSEMBLY
+        .replace("sequence:", &format!("{protected}sequence:"))
+        .replace("branch:", ".text\n.code64\n\nbranch:");
+    assert_eq!(
+        validate(&linked_fixture_with(&boot_only, LINKER_SCRIPT)).unwrap(),
+        4
+    );
+    for (start, end) in [
+        ("branch:", "tail_call:"),
+        ("tail_call:", "call:"),
+        ("call:", "destination:"),
+    ] {
+        let assembly = ASSEMBLY
+            .replace(&format!("\n{start}"), &format!("\n{protected}{start}"))
+            .replace(&format!("\n{end}"), &format!("\n.text\n.code64\n\n{end}"));
+        assert_invalid(
+            &linked_fixture_with(&assembly, LINKER_SCRIPT),
+            "runtime slot overlaps protected text",
+        );
+    }
+}
+
+#[test]
+fn protected_boundaries_are_required_and_checked_without_any_sites() {
+    let mut empty = linked_fixture();
+    clear_descriptors(&mut empty);
+    assert_eq!(validate(&empty).unwrap(), 0);
+    for (replacement, message) in [
+        ("", "missing linker symbol __alternatives_protected_end"),
+        (
+            "__alternatives_protected_end = . - 1;",
+            "reversed protected text",
+        ),
+        (
+            "__alternatives_protected_end = . + 0x100000;",
+            "protected range outside .text",
+        ),
+    ] {
+        let script = LINKER_SCRIPT.replace("__alternatives_protected_end = .;", replacement);
+        let mut bytes = linked_fixture_with(ASSEMBLY, &script);
+        clear_descriptors(&mut bytes);
+        assert_invalid(&bytes, message);
+    }
+}
+
+#[test]
+fn even_partial_runtime_slot_overlap_with_protected_text_is_rejected() {
+    // Put only the last byte of the branch inside the protected range.
+    let script = LINKER_SCRIPT
+        .replace(
+            "__alternatives_protected_start = .;",
+            "__alternatives_protected_start = . + 7;",
+        )
+        .replace(
+            "__alternatives_protected_end = .;",
+            "__alternatives_protected_end = . + 8;",
+        );
+    assert_invalid(
+        &linked_fixture_with(ASSEMBLY, &script),
+        "runtime slot overlaps protected text",
+    );
 }

@@ -9,8 +9,8 @@
 //! groups, while typed site handles permit selecting individual members.
 //!
 //! Owners submit requests through a mutable reference to a local
-//! [`AlternativePatchBuilder`]. Its boot-only [`commit`](AlternativePatchBuilder::commit)
-//! method consumes the builder, prepares its requests, and applies them before AP
+//! [`AlternativePatchBuilder`]. Its `commit` method consumes the builder and
+//! applies its requests using the phase's protocol. Boot commits run before AP
 //! startup. Batch preparation is internal and does not access executable bytes.
 //! Missing requests leave sites unchanged; disabling requires an explicit reverse
 //! conversion. There is no global condition bitmap or frozen policy.
@@ -20,11 +20,22 @@
 //! backup is retained.
 //! A batch is neither a globally atomic transaction nor a rollback facility.
 //!
-//! Runtime builders accept control-transfer requests, but have no `commit`
-//! method until SMP synchronization, INT3 handling, and target-lifetime
-//! requirements are implemented. Phase types prevent using runtime requests
-//! with the boot executor. Tracing tests use explicit assembly entries; compiler
-//! instrumentation and dynamic log integration are not added.
+//! Runtime commits accept only single-instruction, five-byte NOP/JMP/CALL
+//! conversions. A mutex serializes writers, while temporary INT3 breakpoints
+//! and three all-CPU instruction-serialization rounds protect execution. The
+//! breakpoint handler emulates the desired instruction without blocking. Its
+//! immutable batch metadata lives only until the last synchronization and reader
+//! drain; no persistent per-site backup or version object is required.
+//!
+//! Callers must submit runtime commits from ordinary, sleepable task context
+//! after SMP initialization; exception handlers are excluded by this contract.
+//! Code targets and their dependencies remain resident: disabling a site does
+//! not wait for old callbacks to finish. CPU hotplug and supervisor CET are not
+//! supported. The patching and trap infrastructure must remain uninstrumented.
+//! NMI/MCE handling and recovery are not implemented here; runtime sites must
+//! not be reachable from those handlers. Ordinary IRQ execution is supported.
+//! Tracing tests use explicit assembly entries; compiler instrumentation and
+//! dynamic log integration are not added.
 //!
 //! # Safety boundaries
 //!
@@ -33,6 +44,13 @@
 //! mappings and linker boundaries, lengths, ranges, non-overlapping slots, and
 //! initial control instructions. Stripping and boot-header transformations must
 //! preserve the checked sections. Custom build flows must provide the same check.
+//! The runtime patching core and Rust breakpoint dispatch use the input section
+//! `.text.alternatives_protected`, collected within `.text`. OSDK rejects runtime
+//! slots overlapping its linker boundaries, while permitting boot-only sequences.
+//! Entry/return assembly is not covered by this section. The unsafe commit
+//! contract excludes selected sites from that assembly and all patching/trap
+//! dependencies. The section check does not cover arbitrary compiler
+//! instrumentation or callbacks that depend on the ongoing commit.
 //!
 //! [`AlternativeTable`] decodes this validated image; it does not repeat static
 //! ELF validation at boot. Loading must preserve the validated address relations
@@ -42,8 +60,8 @@
 //! Sequence replacements must obey the macro's position-independence constraints.
 //!
 //! The current production registry has no emitted sites. Kernel tests exercise
-//! all four contracts through a single boot batch, then execute the patched
-//! functions. Host checks cover macro layouts and compile-time API rejection.
+//! all four contracts at boot and reversible control transfers at runtime.
+//! Host checks cover macro layouts and compile-time API rejection.
 
 mod alternative_macros;
 mod encoding;
@@ -51,12 +69,14 @@ mod error;
 mod patch;
 pub(super) mod registry;
 pub(super) mod request;
+mod runtime;
 mod table;
 #[cfg(ktest)]
 mod test;
 
 pub(super) use error::AlternativesError;
 pub(super) use request::{AlternativeBoot, AlternativePatchBuilder};
+pub(super) use runtime::handle_breakpoint;
 pub(super) use table::AlternativeTable;
 #[cfg(ktest)]
 pub(super) use test::configure_test_alternatives;

@@ -97,6 +97,10 @@ SECTIONS
 
     .text                   : AT(ADDR(.text) - KERNEL_VMA) {
         __text_start = .;
+        # Runtime alternatives must not modify entry or patching infrastructure.
+        __alternatives_protected_start = .;
+        *(.text.alternatives_protected .text.alternatives_protected.*)
+        __alternatives_protected_end = .;
         *(.text .text.*)
         __text_end = .;
         PROVIDE(__etext = .);

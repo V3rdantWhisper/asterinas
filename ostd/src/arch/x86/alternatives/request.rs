@@ -6,9 +6,8 @@
 //! request keep their current instructions. A batch describes one final conversion per site,
 //! not a sequence of commands and not a globally atomic transaction.
 //!
-//! Boot builders expose a consuming `commit` method. Batch preparation remains
-//! internal. Runtime builders have no `commit` method until an SMP text-patching
-//! backend is available.
+//! Both phases expose a consuming `commit` method. Batch preparation remains
+//! internal; the phase selects the appropriate execution protocol.
 
 #[cfg(ktest)]
 mod test;
@@ -28,6 +27,7 @@ use super::{
         AlternativeBranch, AlternativeCall, AlternativeCallTrampoline, AlternativeGroup,
         AlternativeSequence, AlternativeTailCall, AlternativeTailCallTarget,
     },
+    runtime,
     table::{AlternativeSelection, AlternativeSitePayload, AlternativeTable},
 };
 
@@ -36,7 +36,6 @@ static BOOT_PATCHING_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 /// The phase permitting instruction replacement before AP startup.
 pub(in crate::arch) enum AlternativeBoot {}
 /// The phase permitting only supported control-transfer conversions.
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(in crate::arch) enum AlternativeRuntime {}
 
 pub(in crate::arch) trait AlternativePhase: sealed::Phase {}
@@ -125,6 +124,46 @@ impl<'a, P: AlternativePhase> AlternativePatchBuilder<'a, P> {
             selection,
             AlternativePatchOperation::Call { expected, desired },
         )
+    }
+}
+
+impl AlternativePatchBuilder<'_, AlternativeRuntime> {
+    /// Consumes the builder and applies control-transfer requests on live CPUs.
+    ///
+    /// Commits are serialized. Every expected instruction is checked before any
+    /// write; an error leaves all sites unchanged. During a successful commit,
+    /// individual sites may execute either the old or the new behavior. Success
+    /// does not mean that previously entered callbacks have finished executing.
+    /// Returns an error before SMP initialization, without a current task, in an
+    /// IRQ handler, or with local IRQs disabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if preemption is disabled, or if writing or CPU synchronization
+    /// fails after patching starts. Such failures cannot be recovered by retrying.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not invoke this method from an exception handler, even one
+    /// that has enabled IRQs. This restriction is a caller obligation and is not
+    /// detected by the runtime context checks.
+    ///
+    /// All target slots must remain writable in the validated kernel mapping.
+    /// No other mechanism may write them or hold Rust references into them.
+    /// Both behaviors must obey the site's contract in every execution context,
+    /// including ordinary IRQs, and their code and dependencies must remain
+    /// resident. Sites reachable from NMI or MCE handlers are not supported.
+    /// No control flow may enter the middle of a slot. The patcher, breakpoint
+    /// entry/exit, handler, and their dependencies must not contain selected sites
+    /// or depend on the behaviors being changed. Callbacks must not recursively
+    /// commit or wait for this commit. CPU membership must stay fixed, and
+    /// supervisor CET must be disabled throughout the operation.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(in crate::arch) unsafe fn commit(self) -> Result<usize, AlternativesError> {
+        runtime::check_context()?;
+        let batch = self.prepare()?;
+        // SAFETY: The caller provides the live-code and context contracts above.
+        unsafe { runtime::apply_batch(batch) }
     }
 }
 

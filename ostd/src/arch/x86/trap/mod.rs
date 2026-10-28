@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-//! Handles trap.
+//! Kernel trap handling.
 
 pub(super) mod gdt;
 pub(super) mod idt;
@@ -24,19 +24,21 @@ use super::cpu::context::GeneralRegs;
 use crate::{
     arch::{
         cpu::context::CpuException,
-        irq::{HwIrqLine, disable_local, enable_local},
+        irq::{self as arch_irq, HwIrqLine},
     },
     cpu::PrivilegeLevel,
-    irq::call_irq_callback_functions,
+    irq,
     mm::fault::TrapFrameApi,
 };
 
 cfg_select! {
     feature = "cvm_guest" => {
-        use tdx_guest::{tdcall, handle_virtual_exception};
+        use tdx_guest::tdcall;
         use crate::arch::tdx_guest::TrapFrameWrapper;
     }
 }
+
+const BREAKPOINT_VECTOR: usize = 3;
 
 /// Trap frame of kernel interrupt
 ///
@@ -148,19 +150,42 @@ pub(super) struct RawUserContext {
     pub(super) error_code: usize,
 }
 
-/// Handle traps (only from kernel).
+/// Handles traps from kernel mode.
+///
+/// # Safety
+///
+/// `f` must describe the current kernel trap, with local IRQs disabled and
+/// CPU-local state available. The caller must restore the possibly updated frame
+/// when returning. For INT3, the frame must include the gap reserved by `trap.S`:
+/// the saved RSP identifies the interrupted stack, and the word immediately below
+/// it must be writable and disjoint from `f` for CALL emulation.
 // SAFETY: The name does not collide with other symbols.
+// The linker and final ELF checker exclude runtime sites from this entry path.
+#[unsafe(link_section = ".text.alternatives_protected")]
 #[unsafe(no_mangle)]
 unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
+    // Handle patch breakpoints before dispatching general exceptions or IRQs.
+    // This path must not enable IRQs, allocate, or acquire a lock.
+    // SAFETY: The caller supplies a kernel INT3 frame with its emulation gap.
+    if f.trap_num == BREAKPOINT_VECTOR && unsafe { super::alternatives::handle_breakpoint(f) } {
+        return;
+    }
+
+    handle_kernel_trap(f);
+}
+
+// Keep general exception handling out of the protected breakpoint fast path.
+#[inline(never)]
+fn handle_kernel_trap(f: &mut TrapFrame) {
     fn enable_local_if(cond: bool) {
         if cond {
-            enable_local();
+            arch_irq::enable_local();
         }
     }
 
     fn disable_local_if(cond: bool) {
         if cond {
-            disable_local();
+            arch_irq::disable_local();
         }
     }
 
@@ -178,7 +203,7 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             // to avoid nested `#VE`s.
             enable_local_if(was_irq_enabled);
             let mut trapframe_wrapper = TrapFrameWrapper(&mut *f);
-            handle_virtual_exception(&mut trapframe_wrapper, &ve_info);
+            tdx_guest::handle_virtual_exception(&mut trapframe_wrapper, &ve_info);
             *f = *trapframe_wrapper.0;
             disable_local_if(was_irq_enabled);
         }
@@ -195,7 +220,7 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             );
         }
         None => {
-            call_irq_callback_functions(
+            irq::call_irq_callback_functions(
                 f,
                 &HwIrqLine::new(f.trap_num as u8),
                 PrivilegeLevel::Kernel,
