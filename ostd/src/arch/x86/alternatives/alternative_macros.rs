@@ -6,6 +6,9 @@
 //! For sequences with operands, wrap [`alternative_asm_template!`] in an operation-specific
 //! function that owns the register declarations and both variants' side effects.
 //! Both macros are internal to the alternatives subsystem.
+//! Use [`alternative_branch!`] for a Rust boolean branch and [`alternative_call!`]
+//! for a call to a state-preserving trampoline. Tail-call wrappers use
+//! [`alternative_tail_call_asm_template!`] in a naked function with the group's ABI.
 //!
 //! Assembly files use `OSTD_ALTERNATIVE` from `alternative_macros.S`.
 //! Include it in the same `global_asm!` invocation as its consumer,
@@ -134,6 +137,111 @@ macro_rules! alternative_asm_template {
 
 #[cfg_attr(not(ktest), expect(unused_imports))]
 pub(super) use alternative_asm_template;
+
+// Share the control descriptor layout between the Rust frontends. Numeric local
+// labels remain unique when LLVM inlines or duplicates a containing function.
+#[cfg_attr(not(ktest), expect(unused_macros))]
+macro_rules! alternative_control_asm_template {
+    ($instruction:literal, $payload:literal, $kind:literal) => {
+        concat!(
+            "2:\n",
+            $instruction,
+            "\n",
+            ".pushsection .altinstructions,\"a\",@progbits\n",
+            ".balign 4\n",
+            ".long 2b - .\n",
+            ".long ",
+            $payload,
+            "\n",
+            ".long {alt_group_id}\n",
+            ".short 5, 0\n",
+            ".long ",
+            $kind,
+            "\n",
+            ".popsection\n",
+        )
+    };
+}
+
+#[cfg_attr(not(ktest), expect(unused_imports))]
+pub(super) use alternative_control_asm_template;
+
+/// Evaluates to whether a patchable Rust branch is enabled, initially false.
+///
+/// The label operand exposes both successors to the compiler, including Rust
+/// cleanup on either path. Each expansion emits a site in the specified group.
+/// See Rust's [label operand rules](https://doc.rust-lang.org/reference/inline-assembly.html#asm.operand-type.supported-operands.label).
+///
+/// # Safety
+///
+/// Both branches must be valid whenever the owner selects them. The owner must
+/// uphold the boot or runtime commit contract for this site and its callees.
+#[cfg_attr(not(ktest), expect(unused_macros))]
+macro_rules! alternative_branch {
+    ($group:ty $(,)?) => {
+        'alternative_branch: {
+            ::core::arch::asm!(
+                $crate::arch::alternatives::alternative_macros::alternative_control_asm_template!(
+                    ".byte 0x0f, 0x1f, 0x44, 0x00, 0x00", "{alt_destination} - .", "1"
+                ),
+                alt_group_id = const $crate::arch::alternatives::registry::branch_id::<$group>(),
+                alt_destination = label { break 'alternative_branch true },
+                options(nostack, preserves_flags),
+            );
+            false
+        }
+    };
+}
+
+#[cfg_attr(not(ktest), expect(unused_imports))]
+pub(super) use alternative_branch;
+
+/// Emits an initially disabled call to a state-preserving trampoline.
+///
+/// The assembly may access memory and use the stack even while disabled, so the
+/// compiler makes the enclosing function ready for an enabled call. There are
+/// no register operands: an ordinary C function is not a suitable trampoline.
+///
+/// # Safety
+///
+/// Every selected trampoline must preserve all registers and flags, restore the
+/// stack, and return normally. Its memory accesses must obey Rust's aliasing rules.
+/// The owner must uphold the commit contract for this site and its callees.
+#[cfg_attr(not(ktest), expect(unused_macros))]
+macro_rules! alternative_call {
+    ($group:ty $(,)?) => {
+        ::core::arch::asm!(
+            $crate::arch::alternatives::alternative_macros::alternative_control_asm_template!(
+                ".byte 0x0f, 0x1f, 0x44, 0x00, 0x00", "0", "3"
+            ),
+            alt_group_id = const $crate::arch::alternatives::registry::call_id::<$group>(),
+            options(preserves_flags),
+        )
+    };
+}
+
+#[cfg_attr(not(ktest), expect(unused_imports))]
+pub(super) use alternative_call;
+
+/// Produces a tail-call slot for a naked wrapper with its group's function ABI.
+///
+/// Supply `alt_destination = sym target` and `alt_group_id = const tail_call_id::<G>()`
+/// to `naked_asm!`. The wrapper and every target must have the signature declared
+/// by `G`. A naked wrapper preserves stack arguments and the caller's return
+/// address; this template must not bypass a normal Rust function's epilogue.
+#[cfg_attr(not(ktest), expect(unused_macros))]
+macro_rules! alternative_tail_call_asm_template {
+    () => {
+        $crate::arch::alternatives::alternative_macros::alternative_control_asm_template!(
+            ".byte 0xe9\n.long {alt_destination} - . - 4",
+            "{alt_destination} - .",
+            "2"
+        )
+    };
+}
+
+#[cfg_attr(not(ktest), expect(unused_imports))]
+pub(super) use alternative_tail_call_asm_template;
 
 /// Defines dense IDs and sealed group types from one declaration.
 ///

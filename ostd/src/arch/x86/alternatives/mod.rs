@@ -34,8 +34,8 @@
 //! supported. The patching and trap infrastructure must remain uninstrumented.
 //! NMI/MCE handling and recovery are not implemented here; runtime sites must
 //! not be reachable from those handlers. Ordinary IRQ execution is supported.
-//! Tracing tests use explicit assembly entries; compiler instrumentation and
-//! dynamic log integration are not added.
+//! Tests cover assembly entries and explicit Rust branch/call sites; automatic
+//! compiler instrumentation and dynamic log integration are not added.
 //!
 //! # Safety boundaries
 //!

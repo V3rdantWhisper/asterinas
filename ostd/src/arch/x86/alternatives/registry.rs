@@ -21,6 +21,9 @@ define_alternative_groups! {
     #[cfg(ktest)] TestRuntimeBranch: Branch,
     #[cfg(ktest)] TestRuntimeTailCall: TailCall(unsafe extern "C" fn(u64) -> u64),
     #[cfg(ktest)] TestRuntimeTrace: Call,
+    #[cfg(ktest)] TestRustBranch: Branch,
+    #[cfg(ktest)] TestRustTailCall: TailCall(unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64),
+    #[cfg(ktest)] TestRustCall: Call,
 }
 
 /// A group declared in the alternatives registry.
@@ -127,6 +130,24 @@ impl AlternativeCallTrampoline {
 /// Returns the descriptor ID only for a registered sequence group.
 #[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const fn sequence_id<G: AlternativeGroup<Kind = AlternativeSequence>>() -> u32 {
+    G::ID.as_raw()
+}
+
+/// Returns the descriptor ID only for a registered branch group.
+#[cfg_attr(not(ktest), expect(dead_code))]
+pub(super) const fn branch_id<G: AlternativeGroup<Kind = AlternativeBranch>>() -> u32 {
+    G::ID.as_raw()
+}
+
+/// Returns the descriptor ID only for a registered tail-call group.
+#[cfg_attr(not(ktest), expect(dead_code))]
+pub(super) const fn tail_call_id<G: AlternativeGroup<Kind = AlternativeTailCall>>() -> u32 {
+    G::ID.as_raw()
+}
+
+/// Returns the descriptor ID only for a registered call group.
+#[cfg_attr(not(ktest), expect(dead_code))]
+pub(super) const fn call_id<G: AlternativeGroup<Kind = AlternativeCall>>() -> u32 {
     G::ID.as_raw()
 }
 

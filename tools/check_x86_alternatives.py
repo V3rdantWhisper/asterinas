@@ -325,6 +325,73 @@ pub(super) fn run() {{}}
             print(f"PASS: {label}")
 
 
+def check_rust_control_interfaces(directory):
+    entries = """
+Sequence: Sequence,
+Branch: Branch,
+TailCall: TailCall(unsafe extern "C" fn(u64) -> u64),
+Call: Call,
+"""
+    cases = [
+        ("branch-and-call", """
+unsafe { alternative_call!(groups::Call); }
+if unsafe { alternative_branch!(groups::Branch) } { 42 } else { value }
+""", None),
+        ("branch-kind-mismatch", """
+if unsafe { alternative_branch!(groups::Sequence) } { 42 } else { value }
+""", "E0271"),
+        ("call-kind-mismatch", """
+unsafe { alternative_call!(groups::Branch); }
+value
+""", "E0271"),
+        ("tail-call-kind-mismatch", """
+registry::tail_call_id::<groups::Call>() as u64
+""", "E0271"),
+        ("branch-missing-unsafe", """
+if alternative_branch!(groups::Branch) { 42 } else { value }
+""", "E0133"),
+        ("call-missing-unsafe", """
+alternative_call!(groups::Call);
+value
+""", "E0133"),
+    ]
+    for optimization in (0, 3):
+        for name, body, diagnostic in cases:
+            source = generate_harness(entries, f'''
+use alternative_macros::{{alternative_branch, alternative_call, alternative_tail_call_asm_template}};
+#[unsafe(no_mangle)]
+pub extern "C" fn test_alternative(value: u64) -> u64 {{ {body} }}
+#[unsafe(naked)]
+unsafe extern "C" fn tail_call(value: u64) -> u64 {{
+    core::arch::naked_asm!(
+        alternative_tail_call_asm_template!(),
+        alt_group_id = const registry::tail_call_id::<groups::TailCall>(),
+        alt_destination = sym test_alternative,
+    );
+}}
+pub(super) fn run() {{ let _ = groups::TailCall::target(tail_call); }}
+''')
+            rust_source = directory / "check.rs"
+            rust_source.write_text("#![no_std]\n" + source)
+            result = subprocess.run(
+                ["rustc", "--edition=2024", "--crate-type=lib", "--cfg=ktest",
+                 "--target=x86_64-unknown-none", "--emit=obj,llvm-ir",
+                 "-C", f"opt-level={optimization}", str(rust_source),
+                 "--out-dir", str(directory)],
+                cwd=ROOT, capture_output=True, text=True, check=False,
+            )
+            label = f"rust control interface, opt-level={optimization}, {name}"
+            if diagnostic is None:
+                if result.returncode != 0:
+                    raise RuntimeError(f"{label}: {result.stderr}")
+                # The compiler must see both Rust successors, even though the
+                # initial instructions fall through. This is not a plain asm call.
+                assert "callbr void asm sideeffect" in (directory / "check.ll").read_text(), label
+            elif result.returncode == 0 or diagnostic not in result.stderr:
+                raise RuntimeError(f"{label}: unexpected result\n{result.stderr}")
+            print(f"PASS: {label}")
+
+
 def check_builder_types(directory):
     entries = """
 Sequence: Sequence,
@@ -435,6 +502,7 @@ def main():
         directory = Path(temporary)
         check_id_registry(directory)
         check_rust_interface(directory)
+        check_rust_control_interfaces(directory)
         check_builder_types(directory)
         for frontend in ("rust", "assembly"):
             for optimization in (0, 3):

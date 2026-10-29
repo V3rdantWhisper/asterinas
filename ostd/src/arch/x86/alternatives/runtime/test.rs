@@ -13,6 +13,8 @@ use crate::{
     sync::WaitQueue,
 };
 
+mod rust_sites;
+
 // The hook runs on every CPU with IRQs disabled, inside all three serialization
 // rounds. This deterministically exercises actual INT3 entry/return, rather than
 // relying on a stress loop to happen to catch the short transitional window.
@@ -82,6 +84,7 @@ pub(super) fn record_breakpoint() {
 }
 
 pub(super) fn exercise_instructions() {
+    rust_sites::exercise_instructions();
     let state = EXERCISE_STATE.load(Ordering::Acquire);
     if state == EXERCISE_INACTIVE {
         return;
